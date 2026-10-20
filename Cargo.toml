@@ -1,0 +1,19 @@
+[package]
+name = "eno-shell"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "eno-shell"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+eno-filetype-eno = { git = "https://github.com/fans656/eno-filetype-eno.git", rev = "18cc83085532236db11f59383fc5550d341c44f9" }
+eno-filetype-yaml = { git = "https://github.com/fans656/eno-filetype-yaml.git", rev = "8cc0e8ebe3b2dca9675c86d8ba969365330a6d64" }
+
+[dev-dependencies]
+tempfile = "3"
