@@ -24,6 +24,7 @@ hand-written YAML.
 ---
 image: eno-base            # bare = latest
 user: 501:20
+hostname: sen
 workdir: /home/dav
 volumes:
   - $HOME/work:/home/dav
@@ -32,7 +33,10 @@ environment:
 ---
 ```
 
-- `image`, `user`, `workdir` — scalars; `workdir` is the shell's initial cwd.
+- `image`, `user`, `hostname`, `workdir` — scalars; `workdir` is the shell's
+  initial cwd.
+- A numeric `user` gets a passwd entry named after `workdir`'s basename, so a
+  prompt's `\u` resolves to that name (the container's uid has no login name).
 - `volumes` — `host:container[:ro|rw]`; a relative host path is relative to
   the conf file.
 - `environment` — `KEY=VALUE` entries for the container.

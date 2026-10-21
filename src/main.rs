@@ -26,6 +26,7 @@ struct Response {
 struct Conf {
     image: String,
     user: Option<String>,
+    hostname: Option<String>,
     workdir: String,
     volumes: Vec<(PathBuf, String, String)>,
     environment: Vec<(String, String)>,
@@ -56,6 +57,13 @@ impl Conf {
         let user = match map.get("user") {
             Some(value) => {
                 let value = expand(value.as_str().ok_or("conf: `user` must be a string")?);
+                if value.is_empty() { None } else { Some(value) }
+            }
+            None => None,
+        };
+        let hostname = match map.get("hostname") {
+            Some(value) => {
+                let value = expand(value.as_str().ok_or("conf: `hostname` must be a string")?);
                 if value.is_empty() { None } else { Some(value) }
             }
             None => None,
@@ -98,6 +106,7 @@ impl Conf {
         Ok(Self {
             image,
             user,
+            hostname,
             workdir,
             volumes,
             environment,
@@ -445,6 +454,7 @@ fn ensure_container(conf: &Conf, rid: &str, sid: &str, session: &Path) -> Result
             cid.clone(),
         ])?;
         if state.trim() == "true" {
+            ensure_user(conf, cid)?;
             return Ok(cid.clone());
         }
         docker(&["rm".to_string(), "-f".to_string(), cid.clone()])?;
@@ -462,6 +472,10 @@ fn ensure_container(conf: &Conf, rid: &str, sid: &str, session: &Path) -> Result
         args.push("--user".to_string());
         args.push(user.clone());
     }
+    if let Some(hostname) = &conf.hostname {
+        args.push("--hostname".to_string());
+        args.push(hostname.clone());
+    }
     args.push("-w".to_string());
     args.push(conf.workdir.clone());
     for (source, target, mode) in &conf.volumes {
@@ -478,7 +492,54 @@ fn ensure_container(conf: &Conf, rid: &str, sid: &str, session: &Path) -> Result
     args.push("sleep".to_string());
     args.push("infinity".to_string());
     let cid = docker(&args)?;
-    Ok(cid.trim().to_string())
+    let cid = cid.trim().to_string();
+    ensure_user(conf, &cid)?;
+    Ok(cid)
+}
+
+fn ensure_user(conf: &Conf, cid: &str) -> Result<(), String> {
+    let Some(user) = conf.user.as_deref() else {
+        return Ok(());
+    };
+    let Some((uid, gid)) = user.split_once(':') else {
+        return Ok(());
+    };
+    let Some(name) = Path::new(&conf.workdir)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return Ok(());
+    };
+    let script = format!(
+        "name={}; grep -q \"^${{name}}:\" /etc/passwd || printf '%s:x:%s:%s:%s:%s:/bin/bash\\n' \"$name\" {} {} \"$name\" {} >> /etc/passwd",
+        shell_quote(name),
+        shell_quote(uid),
+        shell_quote(gid),
+        shell_quote(&conf.workdir),
+    );
+    docker(&[
+        "exec".to_string(),
+        "-u".to_string(),
+        "0".to_string(),
+        cid.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        script,
+    ])?;
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut out = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn parse_done(line: &str, n: u64) -> Option<i32> {
@@ -651,11 +712,12 @@ mod tests {
         fs::create_dir_all(d.join("data")).unwrap();
         let path = conf(
             d,
-            "image: eno-base\nuser: 501:20\nworkdir: /home/dav\nvolumes:\n  - data:/data:rw\n  - ../outside:/out:ro\nenvironment:\n  - HOME=/home/dav\n  - K=V\n",
+            "image: eno-base\nuser: 501:20\nhostname: sen\nworkdir: /home/dav\nvolumes:\n  - data:/data:rw\n  - ../outside:/out:ro\nenvironment:\n  - HOME=/home/dav\n  - K=V\n",
         );
         let loaded = Conf::load(&path).unwrap();
         assert_eq!(loaded.image, "eno-base:latest");
         assert_eq!(loaded.user.as_deref(), Some("501:20"));
+        assert_eq!(loaded.hostname.as_deref(), Some("sen"));
         assert_eq!(loaded.workdir, "/home/dav");
         assert_eq!(loaded.volumes[0].0, fs::canonicalize(d.join("data")).unwrap());
         assert_eq!(loaded.volumes[0].1, "/data");
