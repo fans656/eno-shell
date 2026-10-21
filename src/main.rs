@@ -27,6 +27,8 @@ struct Conf {
     image: String,
     user: Option<String>,
     hostname: Option<String>,
+    network: Option<String>,
+    alias: Option<String>,
     workdir: String,
     volumes: Vec<(PathBuf, String, String)>,
     environment: Vec<(String, String)>,
@@ -64,6 +66,20 @@ impl Conf {
         let hostname = match map.get("hostname") {
             Some(value) => {
                 let value = expand(value.as_str().ok_or("conf: `hostname` must be a string")?);
+                if value.is_empty() { None } else { Some(value) }
+            }
+            None => None,
+        };
+        let network = match map.get("network") {
+            Some(value) => {
+                let value = expand(value.as_str().ok_or("conf: `network` must be a string")?);
+                if value.is_empty() { None } else { Some(value) }
+            }
+            None => None,
+        };
+        let alias = match map.get("alias") {
+            Some(value) => {
+                let value = expand(value.as_str().ok_or("conf: `alias` must be a string")?);
                 if value.is_empty() { None } else { Some(value) }
             }
             None => None,
@@ -107,6 +123,8 @@ impl Conf {
             image,
             user,
             hostname,
+            network,
+            alias,
             workdir,
             volumes,
             environment,
@@ -476,6 +494,14 @@ fn ensure_container(conf: &Conf, rid: &str, sid: &str, session: &Path) -> Result
         args.push("--hostname".to_string());
         args.push(hostname.clone());
     }
+    if let Some(network) = &conf.network {
+        args.push("--network".to_string());
+        args.push(network.clone());
+    }
+    if let Some(alias) = &conf.alias {
+        args.push("--network-alias".to_string());
+        args.push(alias.clone());
+    }
     args.push("-w".to_string());
     args.push(conf.workdir.clone());
     for (source, target, mode) in &conf.volumes {
@@ -712,12 +738,14 @@ mod tests {
         fs::create_dir_all(d.join("data")).unwrap();
         let path = conf(
             d,
-            "image: eno-base\nuser: 501:20\nhostname: sen\nworkdir: /home/dav\nvolumes:\n  - data:/data:rw\n  - ../outside:/out:ro\nenvironment:\n  - HOME=/home/dav\n  - K=V\n",
+            "image: eno-base\nuser: 501:20\nhostname: sen\nnetwork: eno-net\nalias: eno.run\nworkdir: /home/dav\nvolumes:\n  - data:/data:rw\n  - ../outside:/out:ro\nenvironment:\n  - HOME=/home/dav\n  - K=V\n",
         );
         let loaded = Conf::load(&path).unwrap();
         assert_eq!(loaded.image, "eno-base:latest");
         assert_eq!(loaded.user.as_deref(), Some("501:20"));
         assert_eq!(loaded.hostname.as_deref(), Some("sen"));
+        assert_eq!(loaded.network.as_deref(), Some("eno-net"));
+        assert_eq!(loaded.alias.as_deref(), Some("eno.run"));
         assert_eq!(loaded.workdir, "/home/dav");
         assert_eq!(loaded.volumes[0].0, fs::canonicalize(d.join("data")).unwrap());
         assert_eq!(loaded.volumes[0].1, "/data");
@@ -742,6 +770,8 @@ mod tests {
             "volumes: x\n",
             "environment:\n  - K\n",
             "user: [x]\n",
+            "network: [x]\n",
+            "alias: [x]\n",
         ] {
             let path = conf(dir.path(), body);
             assert!(Conf::load(&path).is_err(), "{body}");

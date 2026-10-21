@@ -25,6 +25,8 @@ hand-written YAML.
 image: eno-base            # bare = latest
 user: 501:20
 hostname: sen
+network: eno-net
+alias: eno.run
 workdir: /home/dav
 volumes:
   - $HOME/work:/home/dav
@@ -35,6 +37,9 @@ environment:
 
 - `image`, `user`, `hostname`, `workdir` — scalars; `workdir` is the shell's
   initial cwd.
+- `network`, `alias` — a docker network to join and a DNS alias to carry on
+  it; absent, the container runs on the runtime's default network. The
+  network is the caller's to create and remove; `--stop` leaves it alone.
 - A numeric `user` gets a passwd entry named after `workdir`'s basename, so a
   prompt's `\u` resolves to that name (the container's uid has no login name).
 - `volumes` — `host:container[:ro|rw]`; a relative host path is relative to
