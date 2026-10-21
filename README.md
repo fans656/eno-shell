@@ -1,7 +1,8 @@
 # eno/shell
 
-A session shell for a machine. One persistent `bash` inside a per-session
-container; the host client talks to a per-session daemon over a unix socket.
+A session shell for a machine. One persistent shell in a space host; the host
+client talks to a per-session daemon over a unix socket. The shell owns no
+containers: it drives `ENO_SPACE`.
 
 ## CLI
 
@@ -18,33 +19,26 @@ eno-shell [--conf <path>] serve     # internal: the detached daemon
 
 One eno document; its frontmatter is the conf mapping, parsed with
 `eno/filetype/eno` (`eno_filetype_eno::parse`; `Doc.frontmatter`). No
-hand-written YAML.
+hand-written YAML. It is a SESSION conf: the containers belong to the space.
 
 ```
 ---
-image: eno-base            # bare = latest
-user: 501:20
-hostname: sen
-network: eno-net
-alias: eno.run
+user: dav
+host: sen
 workdir: /home/dav
-volumes:
-  - $HOME/work:/home/dav
 environment:
-  - HOME=/home/dav
+  - PS1=\u@\h:\W$ 
+shell: bash
 ---
 ```
 
-- `image`, `user`, `hostname`, `workdir` — scalars; `workdir` is the shell's
-  initial cwd.
-- `network`, `alias` — a docker network to join and a DNS alias to carry on
-  it; absent, the container runs on the runtime's default network. The
-  network is the caller's to create and remove; `--stop` leaves it alone.
-- A numeric `user` gets a passwd entry named after `workdir`'s basename, so a
-  prompt's `\u` resolves to that name (the container's uid has no login name).
-- `volumes` — `host:container[:ro|rw]`; a relative host path is relative to
-  the conf file.
-- `environment` — `KEY=VALUE` entries for the container.
+- `user` — required; a name or a numeric uid (the space's spec resolves it).
+- `host` — optional; a name is resolved to its space host, a numeric uid
+  needs it.
+- `workdir` — the session's cwd; absent, the user's home.
+- `environment` — `KEY=VALUE` entries for the session. The space sets
+  `HOME`, `USER`, and `LOGNAME` from the user unless a key is overridden here.
+- `shell` — the persistent shell (default `bash`).
 
 `$VAR` is expanded from the host env (`$HOME`, `$ENO_WEAVE_TMP`, …).
 
@@ -53,13 +47,15 @@ environment:
 One session per material (`ENO_SHELL_SESSION`, defaulted from
 `ENO_WEAVE_MATERIAL` by stripping the extension). The session dir is
 `$ENO_WEAVE_TMP/.sessions/<id>` and holds only the daemon's socket and pid
-file; nothing is mounted into the container, so the same client can later
-drive `ssh -T host bash`. Containers carry `eno-shell=<ENO_WEAVE_TMP>` and
-`eno-session=<id>`.
+file; nothing is mounted anywhere. One space id scopes the network, the hosts,
+and their users, so sessions share a host's container and never own one.
 
-The daemon holds `docker exec -i <cid> bash` and, per command, writes ONE
-wrapper to the bash's stdin — a fresh random heredoc delimiter, the script
-verbatim, and the request's stdin base64-decoded into the eval:
+The transport is the `ENO_SPACE` executable (loud when unset): `serve` runs
+`ENO_SPACE up` (idempotent), then holds
+`ENO_SPACE exec [--host <h>] --user <u> [--cwd <w>] [-e K=V]... -i -- <shell>`.
+Per command it writes ONE wrapper to the shell's stdin — a fresh random heredoc
+delimiter, the script verbatim, and the request's stdin base64-decoded into the
+eval:
 
 ```
 eval "$(cat <<'ENO_<nonce>'
@@ -69,21 +65,15 @@ ENO_<nonce>
 printf '\n\036ENO <nonce> %s\n' "$?"
 ```
 
-The eval's stdout and stderr are the data channel, merged as bytes; the bash's
+The eval's stdout and stderr are the data channel, merged as bytes; the shell's
 own stderr stays the daemon's. The marker line carries the status, and exactly
 one trailing newline (the marker's prefix) is removed from the data. A command
 cannot eat the channel (its stdin is always the decoded request), there is no
 polling, and one command runs at a time. The shell's cwd/env/functions persist.
 An `exit` in a command ends that shell: the command gets the shell's exit
-status, and the next command starts a fresh shell in the same container.
-
-## Runtime
-
-`ENO_SHELL_RUNTIME` selects the container CLI (default `docker`;
-`ENO_SHELL_DOCKER` is the older spelling). The command shape is the same for a
-later podman backend.
+status, and the next command starts a fresh shell in the same host.
 
 ## `--stop`
 
-Kills the per-session daemons, removes their containers, and deletes
-`.sessions`; idempotent.
+Kills the per-session daemons and deletes `.sessions`; idempotent. It does not
+touch containers — those are the space's (`ENO_SPACE down`).
