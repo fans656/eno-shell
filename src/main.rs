@@ -430,9 +430,10 @@ fn run(conf_path: &Path, script: &str) -> Result<i32, String> {
 }
 
 struct Shell {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    dead: bool,
 }
 
 impl Shell {
@@ -450,14 +451,15 @@ impl Shell {
         let stdin = child.stdin.take().ok_or("bash: no stdin")?;
         let stdout = child.stdout.take().ok_or("bash: no stdout")?;
         Ok(Self {
-            _child: child,
+            child,
             stdin,
             stdout: BufReader::new(stdout),
+            dead: false,
         })
     }
 }
 
-fn ensure_container(conf: &Conf, rid: &str, sid: &str, session: &Path) -> Result<String, String> {
+fn ensure_container(conf: &Conf, rid: &str, sid: &str) -> Result<String, String> {
     for (source, _target, mode) in &conf.volumes {
         if mode == "rw" {
             fs::create_dir_all(source).map_err(|e| format!("{}: {e}", source.display()))?;
@@ -508,8 +510,6 @@ fn ensure_container(conf: &Conf, rid: &str, sid: &str, session: &Path) -> Result
         args.push("-v".to_string());
         args.push(format!("{}:{target}:{mode}", source.display()));
     }
-    args.push("-v".to_string());
-    args.push(format!("{}:/session:rw", realpath_lenient(session).display()));
     for (key, value) in &conf.environment {
         args.push("-e".to_string());
         args.push(format!("{key}={value}"));
@@ -568,52 +568,105 @@ fn shell_quote(value: &str) -> String {
     out
 }
 
-fn parse_done(line: &str, n: u64) -> Option<i32> {
-    let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
-    let prefix = format!("done {n} ");
-    line.strip_prefix(&prefix)?.parse().ok()
+fn nonce() -> Result<String, String> {
+    let mut bytes = [0u8; 8];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn handle(
-    shell: &mut Shell,
-    session: &Path,
-    n: &mut u64,
-    stream: UnixStream,
-) -> Result<(), String> {
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let bits = ((chunk[0] as u32) << 16) | ((second as u32) << 8) | third as u32;
+        out.push(TABLE[(bits >> 18) as usize & 63] as char);
+        out.push(TABLE[(bits >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(bits >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[bits as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn wrapper(nonce: &str, script: &str, stdin: &[u8]) -> String {
+    let mut body = script.to_string();
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    format!(
+        "eval \"$(cat <<'ENO_{nonce}'\n{body}ENO_{nonce}\n)\" < <(printf %s '{}' | base64 -d) 2>&1\nprintf '\\n\\036ENO {nonce} %s\\n' \"$?\"\n",
+        base64_encode(stdin),
+    )
+}
+
+fn marker_status(chunk: &[u8], nonce: &str) -> Result<Option<i32>, String> {
+    let prefix = format!("\x1eENO {nonce} ");
+    let Some(rest) = chunk.strip_prefix(prefix.as_bytes()) else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(rest).map_err(|e| format!("marker: {e}"))?;
+    text.trim_end_matches(['\r', '\n'])
+        .parse::<i32>()
+        .map(Some)
+        .map_err(|e| format!("marker status: {e}"))
+}
+
+fn strip_marker_newline(data: &mut Vec<u8>) {
+    if data.last() == Some(&b'\n') {
+        data.pop();
+    }
+}
+
+fn handle(shell: &mut Shell, stream: UnixStream) -> Result<(), String> {
+    if shell.dead {
+        return Err("bash exited".to_string());
+    }
     let request: Request =
         serde_json::from_reader(&stream).map_err(|e| format!("request: {e}"))?;
-    *n += 1;
-    let n = *n;
-    let cmd = session.join(format!("cmd.{n}"));
-    fs::write(&cmd, request.script.as_bytes())
-        .map_err(|e| format!("{}: {e}", cmd.display()))?;
-    let input = session.join(format!("in.{n}"));
-    fs::write(&input, &request.stdin).map_err(|e| format!("{}: {e}", input.display()))?;
-    let line = format!(
-        "eval \"$(cat /session/cmd.{n})\" > /session/out.{n} 2>&1 < /session/in.{n}; echo \"done {n} $?\"\n"
-    );
+    let nonce = nonce()?;
+    let line = wrapper(&nonce, &request.script, &request.stdin);
     shell
         .stdin
         .write_all(line.as_bytes())
         .map_err(|e| format!("bash: {e}"))?;
     shell.stdin.flush().map_err(|e| format!("bash: {e}"))?;
+    let mut output = Vec::new();
     let status = loop {
-        let mut line = String::new();
+        let mut chunk = Vec::new();
         let read = shell
             .stdout
-            .read_line(&mut line)
+            .read_until(b'\n', &mut chunk)
             .map_err(|e| format!("bash: {e}"))?;
         if read == 0 {
-            return Err("bash exited".to_string());
+            shell.dead = true;
+            let code = shell.child.wait().ok().and_then(|status| status.code());
+            break code.ok_or_else(|| "bash exited".to_string())?;
         }
-        if let Some(status) = parse_done(&line, n) {
-            break status;
+        match marker_status(&chunk, &nonce)? {
+            Some(status) => {
+                strip_marker_newline(&mut output);
+                break status;
+            }
+            None => output.extend_from_slice(&chunk),
         }
     };
-    let out = session.join(format!("out.{n}"));
-    let output = fs::read(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let response = Response { output, status };
     serde_json::to_writer(&stream, &response).map_err(|e| format!("socket: {e}"))?;
+    if shell.dead {
+        return Err("bash exited".to_string());
+    }
     Ok(())
 }
 
@@ -629,12 +682,11 @@ fn serve(conf_path: &Path) -> Result<i32, String> {
         UnixListener::bind(&sock).map_err(|e| format!("bind {}: {e}", sock.display()))?;
     fs::write(session.join("daemon.pid"), format!("{}\n", process::id()))
         .map_err(|e| format!("daemon.pid: {e}"))?;
-    let cid = ensure_container(&conf, &rid, &sid, &session)?;
+    let cid = ensure_container(&conf, &rid, &sid)?;
     let mut shell = Shell::spawn(&cid)?;
-    let mut n = 0u64;
     for stream in listener.incoming() {
         let stream = stream.map_err(|e| format!("accept: {e}"))?;
-        if let Err(error) = handle(&mut shell, &session, &mut n, stream) {
+        if let Err(error) = handle(&mut shell, stream) {
             eprintln!("eno-shell: {error}");
             return Err(error);
         }
@@ -805,12 +857,49 @@ mod tests {
     }
 
     #[test]
-    fn done_lines_parse() {
-        assert_eq!(parse_done("done 1 0\n", 1), Some(0));
-        assert_eq!(parse_done("done 2 7\r\n", 2), Some(7));
-        assert_eq!(parse_done("done 1 0\n", 2), None);
-        assert_eq!(parse_done("done 1\n", 1), None);
-        assert_eq!(parse_done("ready\n", 1), None);
+    fn marker_status_parses_the_channel() {
+        assert_eq!(marker_status(b"\x1eENO abc123 0\n", "abc123"), Ok(Some(0)));
+        assert_eq!(
+            marker_status(b"\x1eENO abc123 7\r\n", "abc123"),
+            Ok(Some(7))
+        );
+        assert_eq!(
+            marker_status(b"\x1eENO abc123 130\n", "abc123"),
+            Ok(Some(130))
+        );
+        assert_eq!(marker_status(b"\x1eENO abc123 0", "abc123"), Ok(Some(0)));
+        assert_eq!(marker_status(b"\x1eENO abc123 7\n", "def456"), Ok(None));
+        assert_eq!(marker_status(b"\x1eENO abc123\n", "abc123"), Ok(None));
+        assert!(marker_status(b"\x1eENO abc123 \n", "abc123").is_err());
+    }
+
+    #[test]
+    fn marker_newline_strips_exactly_once() {
+        let mut data = b"hi".to_vec();
+        strip_marker_newline(&mut data);
+        assert_eq!(data, b"hi");
+
+        let mut data = b"hi\n".to_vec();
+        strip_marker_newline(&mut data);
+        assert_eq!(data, b"hi");
+
+        let mut data = b"hi\n\n".to_vec();
+        strip_marker_newline(&mut data);
+        assert_eq!(data, b"hi\n");
+
+        let mut data = Vec::new();
+        strip_marker_newline(&mut data);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn base64_encodes_the_request_stdin() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello\n"), "aGVsbG8K");
+        assert_eq!(base64_encode(b"\x00\xff\n"), "AP8K");
     }
 
     #[test]
