@@ -232,14 +232,10 @@ fn space_command(space: &Path) -> Result<Command, String> {
 }
 
 fn space_name() -> Result<String, String> {
-    for key in ["ENO_SPACE_ID", "ENO_RUN_ID"] {
-        if let Ok(value) = env::var(key) {
-            if !value.is_empty() {
-                return Ok(value);
-            }
-        }
-    }
-    Err("ENO_SPACE_ID (or ENO_RUN_ID) is not set".to_string())
+    env::var("ENO_SPACE_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "ENO_SPACE_ID is not set".to_string())
 }
 
 
