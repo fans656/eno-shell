@@ -210,6 +210,17 @@ fn space_path() -> Result<PathBuf, String> {
     }
 }
 
+fn space_name() -> Result<String, String> {
+    for key in ["ENO_SPACE_ID", "ENO_RUN_ID"] {
+        if let Ok(value) = env::var(key) {
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    Err("ENO_SPACE_ID (or ENO_RUN_ID) is not set".to_string())
+}
+
 fn up(space: &Path) -> Result<(), String> {
     let status = Command::new(space)
         .arg("up")
@@ -319,6 +330,7 @@ impl Shell {
     fn spawn(space: &Path, conf: &Conf) -> Result<Self, String> {
         let mut command = Command::new(space);
         command.arg("exec");
+        command.arg(space_name()?);
         if let Some(host) = &conf.host {
             command.arg("--host").arg(host);
         }
