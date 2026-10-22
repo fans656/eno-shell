@@ -206,8 +206,29 @@ fn default_conf() -> PathBuf {
 fn space_path() -> Result<PathBuf, String> {
     match env::var("ENO_SPACE") {
         Ok(value) if !value.is_empty() => Ok(PathBuf::from(value)),
-        _ => Err("ENO_SPACE is not set (the space executable)".to_string()),
+        _ => Err("ENO_SPACE is not set (the space unit path)".to_string()),
     }
+}
+
+fn eno_bin() -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os("ENO_BIN").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(value));
+    }
+    if let Some(path) = env::var_os("PATH") {
+        for dir in env::split_paths(&path) {
+            let candidate = dir.join("eno");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err("ENO_BIN is not set and `eno` is not on PATH".to_string())
+}
+
+fn space_command(space: &Path) -> Result<Command, String> {
+    let mut command = Command::new(eno_bin()?);
+    command.arg("run").arg(space);
+    Ok(command)
 }
 
 fn space_name() -> Result<String, String> {
@@ -222,7 +243,7 @@ fn space_name() -> Result<String, String> {
 }
 
 fn up(space: &Path) -> Result<(), String> {
-    let status = Command::new(space)
+    let status = space_command(space)?
         .arg("up")
         .status()
         .map_err(|e| format!("{} up: {e}", space.display()))?;
@@ -328,7 +349,7 @@ struct Shell {
 
 impl Shell {
     fn spawn(space: &Path, conf: &Conf) -> Result<Self, String> {
-        let mut command = Command::new(space);
+        let mut command = space_command(space)?;
         command.arg("exec");
         command.arg(space_name()?);
         if let Some(host) = &conf.host {
@@ -536,7 +557,9 @@ fn real_main() -> Result<i32, String> {
             }
         }
     }
-    let conf = conf.unwrap_or_else(default_conf);
+    let conf = conf
+        .or_else(|| env::var_os("ENO_SHELL_CONF").map(PathBuf::from))
+        .unwrap_or_else(default_conf);
     if serve_flag {
         serve(&conf)
     } else if stop_flag {
