@@ -242,20 +242,6 @@ fn space_name() -> Result<String, String> {
     Err("ENO_SPACE_ID (or ENO_RUN_ID) is not set".to_string())
 }
 
-fn up(space: &Path) -> Result<(), String> {
-    let status = space_command(space)?
-        .arg("up")
-        .status()
-        .map_err(|e| format!("{} up: {e}", space.display()))?;
-    if !status.success() {
-        return Err(format!(
-            "{} up: exit {}",
-            space.display(),
-            status.code().unwrap_or(-1)
-        ));
-    }
-    Ok(())
-}
 
 fn spawn_daemon(conf_path: &Path, session: &Path) -> Result<(), String> {
     let log = session.join("daemon.log");
@@ -496,7 +482,6 @@ fn serve(conf_path: &Path) -> Result<i32, String> {
         UnixListener::bind(&sock).map_err(|e| format!("bind {}: {e}", sock.display()))?;
     fs::write(session.join("daemon.pid"), format!("{}\n", process::id()))
         .map_err(|e| format!("daemon.pid: {e}"))?;
-    up(&space)?;
     let mut shell = Shell::spawn(&space, &conf)?;
     for stream in listener.incoming() {
         let stream = stream.map_err(|e| format!("accept: {e}"))?;
