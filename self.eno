@@ -1,7 +1,7 @@
 ---
 name: eno/shell
 desc: a session shell for a machine
-make: cargo build --release && mkdir -p .eno/make/bin && cp target/release/eno-shell .eno/make/bin/
+make: cargo build --release && mkdir -p .eno/make/bin && rm -f .eno/make/bin/eno-shell && cp target/release/eno-shell .eno/make/bin/eno-shell
 run: .eno/make/bin/eno-shell
 test: cargo test
 ---
