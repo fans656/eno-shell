@@ -285,8 +285,7 @@ fn enter_plan(conf_json: &str, name: &str) -> Result<EnterPlan, String> {
         user,
     ];
     if let Some(workdir) = &workdir {
-        exec.push("--cwd".to_string());
-        exec.push(workdir.clone());
+        exec.push(format!("--cwd={workdir}"));
     }
     exec.push("-i".to_string());
     exec.push("--".to_string());
@@ -483,7 +482,7 @@ impl Shell {
         }
         command.arg("--user").arg(&conf.user);
         if let Some(workdir) = &conf.workdir {
-            command.arg("--cwd").arg(workdir);
+            command.arg(format!("--cwd={workdir}"));
         }
         for (key, value) in &conf.environment {
             command.arg("-e").arg(format!("{key}={value}"));
@@ -859,7 +858,7 @@ mod tests {
         assert_eq!(
             plan.exec,
             words(&[
-                "space", "exec", "s", "--host", "h", "--user", "501", "--cwd", "/work", "-i", "--",
+                "space", "exec", "s", "--host", "h", "--user", "501", "--cwd=/work", "-i", "--",
                 "zsh",
             ])
         );
