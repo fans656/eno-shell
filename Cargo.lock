@@ -15,6 +15,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "eno-buf"
+version = "0.0.1"
+source = "git+https://github.com/fans656/eno-buf.git?rev=008f94e8bd6607d95802eecf6cd2f0787acb6527#008f94e8bd6607d95802eecf6cd2f0787acb6527"
+
+[[package]]
+name = "eno-conn"
+version = "0.0.1"
+source = "git+https://github.com/fans656/eno-conn.git?rev=a79a5c3b0d21d918f0ab92a8880313391078f42e#a79a5c3b0d21d918f0ab92a8880313391078f42e"
+dependencies = [
+ "eno-buf",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
+name = "eno-dot"
+version = "0.0.1"
+source = "git+https://github.com/fans656/eno-dot.git?rev=dc061bae5edf0e3e4b93572e1d98bdcd49aafb9c#dc061bae5edf0e3e4b93572e1d98bdcd49aafb9c"
+dependencies = [
+ "eno-conn",
+ "eno-filetype-eno 0.0.1 (git+https://github.com/fans656/eno-filetype-eno.git?rev=1e8cfc8720cd04105dfb2c9a3edd391156d153d9)",
+ "eno-filetype-yaml",
+ "eno-session",
+ "serde_json",
+ "serde_yaml_ng",
+]
+
+[[package]]
 name = "eno-filetype-eno"
 version = "0.0.1"
 source = "git+https://github.com/fans656/eno-filetype-eno.git?rev=18cc83085532236db11f59383fc5550d341c44f9#18cc83085532236db11f59383fc5550d341c44f9"
@@ -22,6 +50,26 @@ dependencies = [
  "eno-filetype-yaml",
  "serde_json",
  "serde_yaml_ng",
+]
+
+[[package]]
+name = "eno-filetype-eno"
+version = "0.0.1"
+source = "git+https://github.com/fans656/eno-filetype-eno.git?rev=1e8cfc8720cd04105dfb2c9a3edd391156d153d9#1e8cfc8720cd04105dfb2c9a3edd391156d153d9"
+dependencies = [
+ "eno-filetype-markdown",
+ "eno-filetype-yaml",
+ "serde_json",
+ "serde_yaml_ng",
+]
+
+[[package]]
+name = "eno-filetype-markdown"
+version = "0.0.1"
+source = "git+https://github.com/fans656/eno-filetype-markdown.git?rev=c022af66b131978b163410b958a79523057f4348#c022af66b131978b163410b958a79523057f4348"
+dependencies = [
+ "markdown",
+ "serde_json",
 ]
 
 [[package]]
@@ -34,10 +82,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eno-session"
+version = "0.0.1"
+source = "git+https://github.com/fans656/eno-session.git?rev=68747e33544b71485f2810dc9f36d2fe3e99476b#68747e33544b71485f2810dc9f36d2fe3e99476b"
+dependencies = [
+ "eno-conn",
+ "serde_json",
+]
+
+[[package]]
 name = "eno-shell"
 version = "0.0.1"
 dependencies = [
- "eno-filetype-eno",
+ "eno-dot",
+ "eno-filetype-eno 0.0.1 (git+https://github.com/fans656/eno-filetype-eno.git?rev=18cc83085532236db11f59383fc5550d341c44f9)",
  "eno-filetype-yaml",
  "libc",
  "serde",
@@ -111,6 +169,16 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "markdown"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5cab8f2cadc416a82d2e783a1946388b31654d391d1c7d92cc1f03e295b1deb"
+dependencies = [
+ "serde",
+ "unicode-id",
+]
 
 [[package]]
 name = "memchr"
@@ -246,6 +314,12 @@ dependencies = [
  "rustix",
  "windows-sys",
 ]
+
+[[package]]
+name = "unicode-id"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65dd75ab2d9d379dbe86d4059e91d8b5a6e7054865eaba1ddbfc7a817ff96392"
 
 [[package]]
 name = "unicode-ident"

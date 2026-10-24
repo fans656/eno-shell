@@ -5,3 +5,36 @@ make: cargo build --release && mkdir -p .eno/make/bin && cp target/release/eno-s
 run: .eno/make/bin/eno-shell
 test: cargo test
 ---
+
+## Dotting
+
+```yaml eno.dot.spec
+shell:
+  default: run
+  opts:
+    '-h, --help': {desc: show this help, flag: true}
+    '-c, --command':
+      desc: the script to run (required for `run`)
+      required: true
+      scope: [session]
+    '--conf':
+      desc: 'the script session conf (default: $ENO_SHELL_CONF, else <host>/shell.eno)'
+      scope: [session, daemon]
+  verbs:
+    run:
+      desc: run a script in the session shell
+      group: session
+    enter:
+      desc: enter a machine from the shell conf (ENO_CONF)
+      group: machine
+      args:
+        - {name: name, desc: 'the machine name (ENO_CONF `shell.<name>`)'}
+      opts:
+        '--keep': {desc: leave the space up when the shell exits, flag: true}
+    stop:
+      desc: stop the session daemon
+      group: daemon
+    serve:
+      desc: run the session daemon (internal; spawned by run)
+      group: daemon
+```

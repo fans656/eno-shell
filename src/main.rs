@@ -4,7 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{self, Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{self, Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -238,6 +238,138 @@ fn space_name() -> Result<String, String> {
         .ok_or_else(|| "ENO_SPACE_ID is not set".to_string())
 }
 
+/// The commands one `eno shell <name>` runs. Pure: no process is spawned, so
+/// the conf -> argv translation is testable without docker or `eno`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnterPlan {
+    space: String,
+    host: String,
+    ls: Vec<String>,
+    up: Vec<String>,
+    exec: Vec<String>,
+    down: Vec<String>,
+}
+
+fn enter_plan(conf_json: &str, name: &str) -> Result<EnterPlan, String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(conf_json).map_err(|e| format!("ENO_CONF: {e}"))?;
+    let node = doc
+        .get("shell")
+        .and_then(|shell| shell.get(name))
+        .ok_or_else(|| format!("ENO_CONF: no `shell.{name}`"))?;
+    let map = node
+        .as_object()
+        .ok_or_else(|| format!("ENO_CONF: `shell.{name}` must be a mapping"))?;
+
+    let space = field(map, name, "space", false)?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("ENO_CONF: `shell.{name}.space` is required"))?;
+    let host = field(map, name, "host", false)?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("ENO_CONF: `shell.{name}.host` is required"))?;
+    let user = field(map, name, "user", true)?
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "0".to_string());
+    let shell = field(map, name, "shell", false)?
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "bash".to_string());
+    let workdir = field(map, name, "workdir", false)?.filter(|value| !value.is_empty());
+
+    let mut exec = vec![
+        "space".to_string(),
+        "exec".to_string(),
+        space.clone(),
+        "--host".to_string(),
+        host.clone(),
+        "--user".to_string(),
+        user,
+    ];
+    if let Some(workdir) = &workdir {
+        exec.push("--cwd".to_string());
+        exec.push(workdir.clone());
+    }
+    exec.push("-i".to_string());
+    exec.push("--".to_string());
+    exec.push(shell);
+
+    Ok(EnterPlan {
+        space: space.clone(),
+        host,
+        ls: vec!["space".to_string(), "ls".to_string(), space.clone()],
+        up: vec!["space".to_string(), "up".to_string(), space.clone()],
+        exec,
+        down: vec!["space".to_string(), "down".to_string(), space],
+    })
+}
+
+fn field(
+    map: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    key: &str,
+    numeric: bool,
+) -> Result<Option<String>, String> {
+    match map.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+        Some(serde_json::Value::Number(number)) if numeric => Ok(Some(number.to_string())),
+        Some(_) if numeric => Err(format!(
+            "ENO_CONF: `shell.{name}.{key}` must be a string or number"
+        )),
+        Some(_) => Err(format!("ENO_CONF: `shell.{name}.{key}` must be a string")),
+    }
+}
+
+fn host_present(ls_output: &str, host: &str) -> bool {
+    ls_output.lines().any(|line| {
+        line.strip_prefix("host ")
+            .and_then(|rest| rest.split_whitespace().next())
+            == Some(host)
+    })
+}
+
+fn enter(name: &str, keep: bool) -> Result<i32, String> {
+    let json =
+        env::var("ENO_CONF").map_err(|_| "ENO_CONF is not set (run through eno)".to_string())?;
+    let plan = enter_plan(&json, name)?;
+    let eno = eno_bin()?;
+
+    let listing = Command::new(&eno)
+        .args(&plan.ls)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", eno.display()))?;
+    if !listing.status.success() {
+        return Err(format!("eno space ls {}: {}", plan.space, listing.status));
+    }
+    let existed = host_present(&String::from_utf8_lossy(&listing.stdout), &plan.host);
+
+    let up = Command::new(&eno)
+        .args(&plan.up)
+        .status()
+        .map_err(|e| format!("{}: {e}", eno.display()))?;
+    if !up.success() {
+        return Err(format!("eno space up {}: {up}", plan.space));
+    }
+
+    let exec = Command::new(&eno).args(&plan.exec).status();
+    // The space was ours exactly when the host was absent before `up`.
+    if !existed && !keep {
+        match Command::new(&eno).args(&plan.down).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!(
+                    "eno-shell: warning: eno space down {}: {status}",
+                    plan.space
+                )
+            }
+            Err(error) => eprintln!("eno-shell: warning: {}: {error}", eno.display()),
+        }
+    }
+    match exec {
+        Ok(status) => Ok(status.code().unwrap_or(1)),
+        Err(error) => Err(format!("{}: {error}", eno.display())),
+    }
+}
 
 fn spawn_daemon(conf_path: &Path, session: &Path) -> Result<(), String> {
     let log = session.join("daemon.log");
@@ -508,56 +640,112 @@ fn stop() -> Result<i32, String> {
     Ok(0)
 }
 
-fn real_main() -> Result<i32, String> {
-    env_defaults();
-    let mut conf: Option<PathBuf> = None;
-    let mut script: Option<String> = None;
-    let mut stop_flag = false;
-    let mut serve_flag = false;
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--conf" => {
-                conf = Some(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| "usage: eno-shell --conf <path>".to_string())?,
-                ));
-            }
-            "-c" => {
-                script = Some(
-                    args.next()
-                        .ok_or_else(|| "usage: eno-shell -c <script>".to_string())?,
-                );
-            }
-            "--stop" => stop_flag = true,
-            "serve" => serve_flag = true,
-            other => {
-                return Err(format!(
-                    "usage: eno-shell [--conf <path>] -c <script> | --stop (unknown `{other}`)"
-                ));
-            }
+fn dispatch(clause: eno_dot::ast::Clause) -> ExitCode {
+    match dispatch_clause(&clause) {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(error) => {
+            eprintln!("eno-shell: {error}");
+            ExitCode::from(1)
         }
-    }
-    let conf = conf
-        .or_else(|| env::var_os("ENO_SHELL_CONF").map(PathBuf::from))
-        .unwrap_or_else(default_conf);
-    if serve_flag {
-        serve(&conf)
-    } else if stop_flag {
-        stop()
-    } else if let Some(script) = script {
-        run(&conf, &script)
-    } else {
-        Err("usage: eno-shell [--conf <path>] -c <script> | --stop".to_string())
     }
 }
 
-fn main() {
-    match real_main() {
-        Ok(code) => process::exit(code),
-        Err(error) => {
-            eprintln!("eno-shell: {error}");
-            process::exit(1);
+fn dispatch_clause(clause: &eno_dot::ast::Clause) -> Result<i32, String> {
+    env_defaults();
+    match clause.verb.as_str() {
+        "run" => {
+            let script = clause
+                .opt("command")
+                .ok_or_else(|| "run: -c/--command is required".to_string())?;
+            let conf = clause
+                .opt("conf")
+                .map(PathBuf::from)
+                .or_else(|| env::var_os("ENO_SHELL_CONF").map(PathBuf::from))
+                .unwrap_or_else(default_conf);
+            run(&conf, script)
+        }
+        "enter" => {
+            let name = clause
+                .arg("name")
+                .ok_or_else(|| "enter: a machine name is required".to_string())?;
+            enter(name, clause.flag("keep"))
+        }
+        "stop" => stop(),
+        "serve" => {
+            let conf = clause
+                .opt("conf")
+                .map(PathBuf::from)
+                .or_else(|| env::var_os("ENO_SHELL_CONF").map(PathBuf::from))
+                .unwrap_or_else(default_conf);
+            serve(&conf)
+        }
+        other => Err(format!("unknown verb {other:?}")),
+    }
+}
+
+fn is_command(argv: &[String]) -> bool {
+    argv.iter().any(|arg| {
+        arg == "-c"
+            || arg == "--command"
+            || arg.starts_with("--command=")
+            || (arg.starts_with("-c") && !arg.starts_with("--"))
+    })
+}
+
+/// dot's `default:` expands only a HEADLESS line, so `eno shell <name>` would be
+/// read as an unknown verb. Make the implicit verb explicit before dot sees it:
+/// `run` when `-c` is present (it wins), else `enter`. A real verb (and a line
+/// with no positional at all) passes through.
+fn with_default_verb(argv: Vec<String>) -> Vec<String> {
+    let command = is_command(&argv);
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = argv[i].as_str();
+        match arg {
+            "--" => {
+                return if i + 1 < argv.len() {
+                    prepend_verb(argv, command)
+                } else {
+                    argv
+                }
+            }
+            "-h" | "--help" | "--keep" => i += 1,
+            "-c" | "--command" | "--conf" => i += 2,
+            _ if arg.starts_with("--command=")
+                || arg.starts_with("--conf=")
+                || (arg.starts_with("-c") && !arg.starts_with("--")) =>
+            {
+                i += 1
+            }
+            _ if arg.starts_with('-') && arg != "-" => i += 1,
+            _ if matches!(arg, "run" | "enter" | "stop" | "serve") => return argv,
+            _ => return prepend_verb(argv, command),
+        }
+    }
+    argv
+}
+
+fn prepend_verb(mut argv: Vec<String>, command: bool) -> Vec<String> {
+    argv.insert(0, if command { "run" } else { "enter" }.to_string());
+    argv
+}
+
+fn main() -> ExitCode {
+    let argv: Vec<String> = env::args().skip(1).collect();
+    let argv = with_default_verb(argv);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match eno_dot::dot!("self.eno").program("eno-shell").invoke(&argv) {
+        eno_dot::Invocation::Run(clause) => dispatch(clause),
+        eno_dot::Invocation::Help(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        eno_dot::Invocation::Error { message, help } => {
+            eprintln!("{message}");
+            if let Some(help) = help {
+                eprint!("{help}");
+            }
+            ExitCode::from(2)
         }
     }
 }
@@ -572,6 +760,114 @@ mod tests {
         let path = dir.join("shell.eno");
         fs::write(&path, format!("---\n{body}---\n")).unwrap();
         path
+    }
+
+    fn words(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_dot_spec_binds_the_cli_contract() {
+        use eno_dot::Invocation;
+        let dot = eno_dot::dot!("self.eno");
+        let run = |argv: &[&str]| {
+            let argv = with_default_verb(words(argv));
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match dot.invoke(&refs) {
+                Invocation::Run(clause) => clause,
+                other => panic!("{argv:?}: {other:?}"),
+            }
+        };
+
+        // `-c` alone is headless and defaults to `run`.
+        let clause = run(&["-c", "echo hi"]);
+        assert_eq!(clause.verb, "run");
+        assert_eq!(clause.opt("command"), Some("echo hi"));
+        // `--conf` is shared, so it works before the defaulted head and the verbs.
+        let clause = run(&["--conf", "/tmp/s.eno", "-c", "echo hi"]);
+        assert_eq!(clause.opt("conf"), Some("/tmp/s.eno"));
+        let clause = run(&["stop", "--conf", "/tmp/s.eno"]);
+        assert_eq!(clause.verb, "stop");
+        assert_eq!(clause.opt("conf"), Some("/tmp/s.eno"));
+        let clause = run(&["serve", "--conf", "/tmp/s.eno"]);
+        assert_eq!(clause.verb, "serve");
+        assert_eq!(clause.opt("conf"), Some("/tmp/s.eno"));
+
+        // A bare name is the implicit `enter`; `--keep` rides along.
+        let clause = run(&["ci-bare"]);
+        assert_eq!(clause.verb, "enter");
+        assert_eq!(clause.arg("name"), Some("ci-bare"));
+        let clause = run(&["--keep", "ci-bare"]);
+        assert_eq!(clause.verb, "enter");
+        assert_eq!(clause.arg("name"), Some("ci-bare"));
+        assert!(clause.flag("keep"));
+        // `--conf` belongs to the script session / daemon, not `enter`.
+        let argv = with_default_verb(words(&["--conf", "/tmp/s.eno", "ci-bare"]));
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        assert!(matches!(dot.invoke(&refs), Invocation::Error { .. }));
+        // With `-c` present the implicit verb is `run`, so the script wins.
+        let clause = run(&["ci-bare", "-c", "echo hi"]);
+        assert_eq!(clause.verb, "run");
+        assert_eq!(clause.opt("command"), Some("echo hi"));
+        // An explicit verb is not swallowed by the implicit one.
+        let clause = run(&["enter", "ci-bare"]);
+        assert_eq!(clause.verb, "enter");
+        assert_eq!(clause.arg("name"), Some("ci-bare"));
+
+        // Empty argv still defaults to `run`; `-c` is required, as before.
+        assert!(matches!(dot.invoke(&[]), Invocation::Error { .. }));
+        assert!(matches!(dot.invoke(&["-c"]), Invocation::Error { .. }));
+    }
+
+    #[test]
+    fn enter_plan_builds_the_commands_with_defaults() {
+        let plan = enter_plan(
+            r#"{"shell":{"ci-bare":{"space":"ci","host":"bare"}}}"#,
+            "ci-bare",
+        )
+        .unwrap();
+        assert_eq!(plan.space, "ci");
+        assert_eq!(plan.host, "bare");
+        assert_eq!(plan.ls, words(&["space", "ls", "ci"]));
+        assert_eq!(plan.up, words(&["space", "up", "ci"]));
+        assert_eq!(
+            plan.exec,
+            words(&["space", "exec", "ci", "--host", "bare", "--user", "0", "-i", "--", "bash",])
+        );
+        assert_eq!(plan.down, words(&["space", "down", "ci"]));
+    }
+
+    #[test]
+    fn enter_plan_honours_every_override() {
+        let plan = enter_plan(
+            r#"{"shell":{"box":{"space":"s","host":"h","user":501,"shell":"zsh","workdir":"/work"}}}"#,
+            "box",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.exec,
+            words(&[
+                "space", "exec", "s", "--host", "h", "--user", "501", "--cwd", "/work", "-i", "--",
+                "zsh",
+            ])
+        );
+    }
+
+    #[test]
+    fn enter_plan_is_loud_about_a_missing_machine() {
+        let error = enter_plan(r#"{"shell":{}}"#, "ci-bare").unwrap_err();
+        assert!(error.contains("shell.ci-bare"), "{error}");
+        let error = enter_plan(r#"{"shell":{"ci-bare":{"host":"bare"}}}"#, "ci-bare").unwrap_err();
+        assert!(error.contains("space"), "{error}");
+        let error = enter_plan("not json", "ci-bare").unwrap_err();
+        assert!(error.contains("ENO_CONF"), "{error}");
+    }
+
+    #[test]
+    fn host_presence_reads_the_ls_lines() {
+        assert!(host_present("space ci\nhost bare  ip=10.0.0.2\n", "bare"));
+        assert!(!host_present("space ci\n  (no hosts)\n", "bare"));
+        assert!(!host_present("space ci\nhost bare2  ip=10.0.0.2\n", "bare"));
     }
 
     #[test]

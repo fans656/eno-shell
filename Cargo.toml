@@ -9,6 +9,7 @@ name = "eno-shell"
 path = "src/main.rs"
 
 [dependencies]
+eno-dot = { git = "https://github.com/fans656/eno-dot.git", rev = "dc061bae5edf0e3e4b93572e1d98bdcd49aafb9c" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
