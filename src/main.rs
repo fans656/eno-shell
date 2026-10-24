@@ -294,11 +294,23 @@ fn enter_plan(conf_json: &str, name: &str) -> Result<EnterPlan, String> {
 
     Ok(EnterPlan {
         space: space.clone(),
-        host,
+        host: host.clone(),
         ls: vec!["space".to_string(), "ls".to_string(), space.clone()],
-        up: vec!["space".to_string(), "up".to_string(), space.clone()],
+        up: vec![
+            "space".to_string(),
+            "up".to_string(),
+            space.clone(),
+            "--host".to_string(),
+            host.clone(),
+        ],
         exec,
-        down: vec!["space".to_string(), "down".to_string(), space],
+        down: vec![
+            "space".to_string(),
+            "down".to_string(),
+            space,
+            "--host".to_string(),
+            host,
+        ],
     })
 }
 
@@ -829,12 +841,12 @@ mod tests {
         assert_eq!(plan.space, "ci");
         assert_eq!(plan.host, "bare");
         assert_eq!(plan.ls, words(&["space", "ls", "ci"]));
-        assert_eq!(plan.up, words(&["space", "up", "ci"]));
+        assert_eq!(plan.up, words(&["space", "up", "ci", "--host", "bare"]));
         assert_eq!(
             plan.exec,
             words(&["space", "exec", "ci", "--host", "bare", "--user", "0", "-i", "--", "bash",])
         );
-        assert_eq!(plan.down, words(&["space", "down", "ci"]));
+        assert_eq!(plan.down, words(&["space", "down", "ci", "--host", "bare"]));
     }
 
     #[test]
