@@ -14,12 +14,7 @@ use serde::{Deserialize, Serialize};
 struct Request {
     script: String,
     stdin: Vec<u8>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Response {
-    output: Vec<u8>,
-    status: i32,
+    nonce: String,
 }
 
 struct Conf {
@@ -447,22 +442,20 @@ fn run(conf_path: &Path, script: &str) -> Result<i32, String> {
     io::stdin()
         .read_to_end(&mut stdin)
         .map_err(|e| format!("stdin: {e}"))?;
+    let nonce = nonce()?;
     let request = Request {
         script: script.to_string(),
         stdin,
+        nonce: nonce.clone(),
     };
     serde_json::to_writer(&mut stream, &request).map_err(|e| format!("socket: {e}"))?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .map_err(|e| format!("socket: {e}"))?;
-    let response: Response =
-        serde_json::from_reader(&mut stream).map_err(|e| format!("socket: {e}"))?;
     let mut stdout = io::stdout().lock();
-    stdout
-        .write_all(&response.output)
-        .map_err(|e| format!("stdout: {e}"))?;
+    let status = relay(&mut stream, &mut stdout, &nonce)?;
     stdout.flush().map_err(|e| format!("stdout: {e}"))?;
-    Ok(response.status)
+    Ok(status)
 }
 
 struct Shell {
@@ -561,51 +554,182 @@ fn marker_status(chunk: &[u8], nonce: &str) -> Result<Option<i32>, String> {
         .map_err(|e| format!("marker status: {e}"))
 }
 
-fn strip_marker_newline(data: &mut Vec<u8>) {
-    if data.last() == Some(&b'\n') {
-        data.pop();
+enum Record {
+    Complete { start: usize, end: usize },
+    Partial { start: usize },
+}
+
+fn find_record(data: &[u8], prefix: &[u8]) -> Option<Record> {
+    let start = data.windows(prefix.len()).position(|window| window == prefix)?;
+    match data[start + prefix.len()..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+    {
+        Some(offset) => Some(Record::Complete {
+            start,
+            end: start + prefix.len() + offset + 1,
+        }),
+        None => Some(Record::Partial { start }),
     }
 }
 
-fn handle(shell: &mut Shell, stream: UnixStream) -> Result<(), String> {
+fn partial_suffix(data: &[u8], prefix: &[u8]) -> Option<usize> {
+    let first = data.len().saturating_sub(prefix.len().saturating_sub(1));
+    (first..data.len()).find(|&start| prefix.starts_with(&data[start..]))
+}
+
+fn write_bytes(stream: &mut UnixStream, bytes: &[u8], client: bool) -> bool {
+    client && stream.write_all(bytes).is_ok()
+}
+
+fn write_trailer(stream: &mut UnixStream, nonce: &str, status: i32) -> io::Result<()> {
+    stream.write_all(format!("\0ENO {nonce} {status}\n").as_bytes())
+}
+
+fn stream_output(
+    reader: &mut impl BufRead,
+    stream: &mut UnixStream,
+    marker_nonce: &str,
+    wire_nonce: &str,
+) -> Result<Option<i32>, String> {
+    let prefix = format!("\x1eENO {marker_nonce} ");
+    let prefix = prefix.as_bytes();
+    let mut pending = Vec::new();
+    let mut client = true;
+    loop {
+        match find_record(&pending, prefix) {
+            Some(Record::Complete { start, end }) => {
+                let status = marker_status(&pending[start..end], marker_nonce)?
+                    .ok_or_else(|| "marker: missing status".to_string())?;
+                let mut output_end = start;
+                if output_end > 0 && pending[output_end - 1] == b'\n' {
+                    output_end -= 1;
+                }
+                client = write_bytes(stream, &pending[..output_end], client);
+                if client {
+                    let _ = write_trailer(stream, wire_nonce, status);
+                }
+                return Ok(Some(status));
+            }
+            Some(Record::Partial { start }) => {
+                let keep = if start > 0 && pending[start - 1] == b'\n' {
+                    start - 1
+                } else {
+                    start
+                };
+                client = write_bytes(stream, &pending[..keep], client);
+                pending.drain(..keep);
+            }
+            None => {
+                let keep = if pending.last() == Some(&b'\n') {
+                    pending.len() - 1
+                } else {
+                    partial_suffix(&pending, prefix).map_or(pending.len(), |start| {
+                        if start > 0 && pending[start - 1] == b'\n' {
+                            start - 1
+                        } else {
+                            start
+                        }
+                    })
+                };
+                client = write_bytes(stream, &pending[..keep], client);
+                pending.drain(..keep);
+            }
+        }
+        let read = {
+            let chunk = reader.fill_buf().map_err(|e| format!("bash: {e}"))?;
+            let read = chunk.len();
+            pending.extend_from_slice(chunk);
+            read
+        };
+        if read == 0 {
+            client = write_bytes(stream, &pending, client);
+            let _ = client;
+            return Ok(None);
+        }
+        reader.consume(read);
+    }
+}
+
+fn parse_wire_status(record: &[u8], nonce: &str) -> Result<i32, String> {
+    let prefix = format!("\0ENO {nonce} ");
+    let rest = record
+        .strip_prefix(prefix.as_bytes())
+        .ok_or_else(|| "wire: missing marker".to_string())?;
+    std::str::from_utf8(rest)
+        .map_err(|e| format!("wire: {e}"))?
+        .trim_end_matches(['\r', '\n'])
+        .parse::<i32>()
+        .map_err(|e| format!("wire status: {e}"))
+}
+
+fn emit(writer: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
+    writer
+        .write_all(bytes)
+        .map_err(|e| format!("stdout: {e}"))?;
+    writer.flush().map_err(|e| format!("stdout: {e}"))
+}
+
+fn relay(reader: &mut impl Read, writer: &mut impl Write, nonce: &str) -> Result<i32, String> {
+    let prefix = format!("\0ENO {nonce} ");
+    let prefix = prefix.as_bytes();
+    let mut pending = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match find_record(&pending, prefix) {
+            Some(Record::Complete { start, end }) => {
+                let status = parse_wire_status(&pending[start..end], nonce)?;
+                emit(writer, &pending[..start])?;
+                return Ok(status);
+            }
+            Some(Record::Partial { start }) => {
+                emit(writer, &pending[..start])?;
+                pending.drain(..start);
+            }
+            None => {
+                let keep = partial_suffix(&pending, prefix).unwrap_or(pending.len());
+                emit(writer, &pending[..keep])?;
+                pending.drain(..keep);
+            }
+        }
+        let read = reader.read(&mut chunk).map_err(|e| format!("socket: {e}"))?;
+        if read == 0 {
+            emit(writer, &pending)?;
+            return Err("bash exited".to_string());
+        }
+        pending.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn handle(shell: &mut Shell, mut stream: UnixStream) -> Result<(), String> {
     if shell.dead {
         return Err("bash exited".to_string());
     }
     let request: Request =
         serde_json::from_reader(&stream).map_err(|e| format!("request: {e}"))?;
-    let nonce = nonce()?;
-    let line = wrapper(&nonce, &request.script, &request.stdin);
+    let marker_nonce = nonce()?;
+    let line = wrapper(&marker_nonce, &request.script, &request.stdin);
     shell
         .stdin
         .write_all(line.as_bytes())
         .map_err(|e| format!("bash: {e}"))?;
     shell.stdin.flush().map_err(|e| format!("bash: {e}"))?;
-    let mut output = Vec::new();
-    let status = loop {
-        let mut chunk = Vec::new();
-        let read = shell
-            .stdout
-            .read_until(b'\n', &mut chunk)
-            .map_err(|e| format!("bash: {e}"))?;
-        if read == 0 {
+    match stream_output(
+        &mut shell.stdout,
+        &mut stream,
+        &marker_nonce,
+        &request.nonce,
+    )? {
+        Some(_) => Ok(()),
+        None => {
             shell.dead = true;
             let code = shell.child.wait().ok().and_then(|status| status.code());
-            break code.ok_or_else(|| "bash exited".to_string())?;
-        }
-        match marker_status(&chunk, &nonce)? {
-            Some(status) => {
-                strip_marker_newline(&mut output);
-                break status;
+            if let Some(status) = code {
+                let _ = write_trailer(&mut stream, &request.nonce, status);
             }
-            None => output.extend_from_slice(&chunk),
+            Err("bash exited".to_string())
         }
-    };
-    let response = Response { output, status };
-    serde_json::to_writer(&stream, &response).map_err(|e| format!("socket: {e}"))?;
-    if shell.dead {
-        return Err("bash exited".to_string());
     }
-    Ok(())
 }
 
 fn serve(conf_path: &Path) -> Result<i32, String> {
@@ -967,23 +1091,105 @@ mod tests {
         assert!(marker_status(b"\x1eENO abc123 \n", "abc123").is_err());
     }
 
+    struct Drip<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+
+    impl Read for Drip<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = self.data.len().min(buf.len()).min(self.step);
+            buf[..count].copy_from_slice(&self.data[..count]);
+            self.data = &self.data[count..];
+            Ok(count)
+        }
+    }
+
     #[test]
-    fn marker_newline_strips_exactly_once() {
-        let mut data = b"hi".to_vec();
-        strip_marker_newline(&mut data);
-        assert_eq!(data, b"hi");
+    fn relay_strips_the_trailer_and_returns_the_status() {
+        let nonce = "0123456789abcdef";
+        for (status, output) in [(0, &b"ok"[..]), (7, &b"bad"[..]), (0, &b""[..])] {
+            let mut input = output.to_vec();
+            input.extend_from_slice(format!("\0ENO {nonce} {status}\n").as_bytes());
+            let mut reader = Drip {
+                data: &input,
+                step: 1,
+            };
+            let mut out = Vec::new();
+            assert_eq!(relay(&mut reader, &mut out, nonce).unwrap(), status);
+            assert_eq!(out, output);
+        }
+    }
 
-        let mut data = b"hi\n".to_vec();
-        strip_marker_newline(&mut data);
-        assert_eq!(data, b"hi");
+    #[test]
+    fn a_marker_with_another_nonce_is_output() {
+        let nonce = "0123456789abcdef";
+        let output = b"a\0ENO fedcba9876543210 3\nb";
+        let mut input = output.to_vec();
+        input.extend_from_slice(format!("\0ENO {nonce} 7\n").as_bytes());
+        let mut reader = input.as_slice();
+        let mut out = Vec::new();
+        assert_eq!(relay(&mut reader, &mut out, nonce).unwrap(), 7);
+        assert_eq!(out, output);
+    }
 
-        let mut data = b"hi\n\n".to_vec();
-        strip_marker_newline(&mut data);
-        assert_eq!(data, b"hi\n");
+    #[test]
+    fn output_streams_before_the_command_ends() {
+        let (shell_side, mut shell) = UnixStream::pair().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let marker_nonce = "1111111111111111";
+        let wire_nonce = "2222222222222222";
+        let marker = format!("\x1eENO {marker_nonce} 0\n");
+        let writer = thread::spawn(move || {
+            shell.write_all(b"first").unwrap();
+            shell.flush().unwrap();
+            thread::sleep(Duration::from_millis(300));
+            shell.write_all(b"second\n\n").unwrap();
+            shell.write_all(marker.as_bytes()).unwrap();
+            shell.flush().unwrap();
+        });
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(shell_side);
+            let mut server = server;
+            stream_output(&mut reader, &mut server, marker_nonce, wire_nonce)
+        });
 
-        let mut data = Vec::new();
-        strip_marker_newline(&mut data);
-        assert!(data.is_empty());
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut first = [0u8; 5];
+        let start = Instant::now();
+        client.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"first");
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "{:?}",
+            start.elapsed()
+        );
+
+        let mut rest = Vec::new();
+        assert_eq!(relay(&mut client, &mut rest, wire_nonce).unwrap(), 0);
+        assert_eq!(rest, b"second\n");
+        assert_eq!(server.join().unwrap().unwrap(), Some(0));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn an_empty_command_outputs_nothing_but_its_status() {
+        let (shell_side, mut shell) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let marker_nonce = "1111111111111111";
+        let wire_nonce = "2222222222222222";
+        write!(shell, "\n\x1eENO {marker_nonce} 0\n").unwrap();
+        shell.flush().unwrap();
+        let mut reader = BufReader::new(shell_side);
+        assert_eq!(
+            stream_output(&mut reader, &mut server, marker_nonce, wire_nonce).unwrap(),
+            Some(0)
+        );
+        let mut out = Vec::new();
+        assert_eq!(relay(&mut client, &mut out, wire_nonce).unwrap(), 0);
+        assert!(out.is_empty());
     }
 
     #[test]

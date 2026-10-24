@@ -73,6 +73,19 @@ polling, and one command runs at a time. The shell's cwd/env/functions persist.
 An `exit` in a command ends that shell: the command gets the shell's exit
 status, and the next command starts a fresh shell in the same host.
 
+The request carries a fresh 64-bit random nonce. The daemon forwards the data
+to the client socket as it arrives, then ends the stream with
+`\0ENO <nonce> <status>\n`, echoing that request nonce. The client writes the
+data to stdout as it arrives, strips that exact trailer, and exits with the
+recorded status. The trailer cannot collide with command output: it starts
+with NUL and carries the unguessable request nonce, which is separate from the
+container wrapper's nonce and never reaches the command. A command that prints
+its own `\0ENO ...` line is still just output unless it reproduces the exact
+nonce. A client that goes away mid-command does not poison the session: the
+daemon drains the command to its marker, then accepts the next one. If the
+shell dies, the daemon logs `bash exited` after forwarding the output it
+already received.
+
 ## `--stop`
 
 Kills the per-session daemons and deletes `.sessions`; idempotent. It does not
