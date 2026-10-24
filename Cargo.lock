@@ -32,7 +32,7 @@ dependencies = [
 [[package]]
 name = "eno-dot"
 version = "0.0.1"
-source = "git+https://github.com/fans656/eno-dot.git?rev=dc061bae5edf0e3e4b93572e1d98bdcd49aafb9c#dc061bae5edf0e3e4b93572e1d98bdcd49aafb9c"
+source = "git+https://github.com/fans656/eno-dot.git?rev=0489456#04894567ecf0670928655e0862a2e3730f0044e5"
 dependencies = [
  "eno-conn",
  "eno-filetype-eno 0.0.1 (git+https://github.com/fans656/eno-filetype-eno.git?rev=1e8cfc8720cd04105dfb2c9a3edd391156d153d9)",
